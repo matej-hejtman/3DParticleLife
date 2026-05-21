@@ -1,0 +1,11 @@
+{
+  "speciesCount": 3,
+  "particleCount": 150000,
+  "minRadius": 1.0,
+  "maxRadius": 8.0,
+  "repulsionStrength": 0.8,
+  "forceScale": 25.0,
+  "damping": 0.995,
+  "worldRadius": 120.0,
+  "trailDecay": 0.15
+}

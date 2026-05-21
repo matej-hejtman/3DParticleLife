@@ -1,0 +1,175 @@
+#version 430 core
+
+layout(local_size_x = 256) in;
+
+struct Particle {
+    vec4 positionType;
+    vec4 velocity;
+};
+
+layout(std430, binding = 0) buffer Particles {
+    Particle particles[];
+};
+
+layout(std430, binding = 1) readonly buffer CellCounts {
+    uint cellCounts[];
+};
+
+layout(std430, binding = 2) readonly buffer CellBuckets {
+    uint cellBuckets[];
+};
+
+layout(std430, binding = 3) readonly buffer Interactions {
+    float interactions[];
+};
+
+uniform uint uParticleCount;
+uniform uint uSpeciesCount;
+uniform uint uGridResolution;
+uniform uint uCellCapacity;
+uniform float uWorldRadius;
+uniform float uMinRadius;
+uniform float uMaxRadius;
+uniform float uRepulsionStrength;
+uniform float uForceScale;
+uniform float uDamping;
+uniform float uMaxVelocity;
+uniform float uBoundaryBounce;
+uniform float uDt;
+uniform int uWrapWorld;
+
+uint cellIndex(ivec3 c) {
+    uint r = uGridResolution;
+    return uint(c.x) + uint(c.y) * r + uint(c.z) * r * r;
+}
+
+ivec3 wrapCell(ivec3 c) {
+    int r = int(uGridResolution);
+    if (c.x < 0) {
+        c.x += r;
+    } else if (c.x >= r) {
+        c.x -= r;
+    }
+    if (c.y < 0) {
+        c.y += r;
+    } else if (c.y >= r) {
+        c.y -= r;
+    }
+    if (c.z < 0) {
+        c.z += r;
+    } else if (c.z >= r) {
+        c.z -= r;
+    }
+    return c;
+}
+
+ivec3 positionToCell(vec3 p) {
+    float worldSize = uWorldRadius * 2.0;
+    vec3 normalized = clamp((p + vec3(uWorldRadius)) / worldSize, vec3(0.0), vec3(0.999999));
+    return ivec3(normalized * float(uGridResolution));
+}
+
+float forceCurve(float r, float attraction) {
+    if (r < 0.0001) {
+        return 0.0;
+    }
+    if (r < uMinRadius) {
+        return -uRepulsionStrength * (1.0 - r / uMinRadius);
+    }
+    if (r <= uMaxRadius) {
+        float t = (r - uMinRadius) / (uMaxRadius - uMinRadius);
+        return attraction * (1.0 - abs(2.0 * t - 1.0));
+    }
+    return 0.0;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uParticleCount) {
+        return;
+    }
+
+    Particle self = particles[id];
+    vec3 pos = self.positionType.xyz;
+    vec3 totalForce = vec3(0.0);
+    uint selfType = min(uint(self.positionType.w + 0.5), uSpeciesCount - 1u);
+
+    float cellSize = (uWorldRadius * 2.0) / float(uGridResolution);
+    int reach = int(ceil(uMaxRadius / cellSize));
+    int gridReach = int(uGridResolution) - 1;
+    reach = min(reach, gridReach);
+    ivec3 baseCell = positionToCell(pos);
+    float maxRadius2 = uMaxRadius * uMaxRadius;
+    float minDistance2 = 0.00000001;
+    vec3 worldSize = vec3(uWorldRadius * 2.0);
+
+    for (int dz = -reach; dz <= reach; ++dz) {
+        for (int dy = -reach; dy <= reach; ++dy) {
+            for (int dx = -reach; dx <= reach; ++dx) {
+                ivec3 cell = baseCell + ivec3(dx, dy, dz);
+                if (uWrapWorld != 0) {
+                    cell = wrapCell(cell);
+                } else {
+                    if (any(lessThan(cell, ivec3(0))) ||
+                        any(greaterThanEqual(cell, ivec3(int(uGridResolution))))) {
+                        continue;
+                    }
+                }
+
+                uint cellId = cellIndex(cell);
+                uint count = min(cellCounts[cellId], uCellCapacity);
+                for (uint i = 0u; i < count; ++i) {
+                    uint otherId = cellBuckets[cellId * uCellCapacity + i];
+                    if (otherId == id) {
+                        continue;
+                    }
+                    Particle other = particles[otherId];
+                    vec3 delta = other.positionType.xyz - pos;
+                    if (uWrapWorld != 0) {
+                        delta -= worldSize * round(delta / worldSize);
+                    }
+                    float r2 = dot(delta, delta);
+                    if (r2 > maxRadius2 || r2 < minDistance2) {
+                        continue;
+                    }
+                    float r = sqrt(r2);
+                    uint otherType = min(uint(other.positionType.w + 0.5), uSpeciesCount - 1u);
+                    float attraction = interactions[selfType * 16u + otherType];
+                    totalForce += (delta / r) * forceCurve(r, attraction);
+                }
+            }
+        }
+    }
+
+    vec3 velocity = (self.velocity.xyz + totalForce * uForceScale * uDt) * uDamping;
+    float speed2 = dot(velocity, velocity);
+    float maxVelocity2 = uMaxVelocity * uMaxVelocity;
+    if (speed2 > maxVelocity2) {
+        velocity *= uMaxVelocity / sqrt(speed2);
+    }
+    pos += velocity * uDt;
+
+    vec3 limit = vec3(uWorldRadius);
+    if (uWrapWorld != 0) {
+        vec3 worldSize = limit * 2.0;
+        pos = mod(pos + limit, worldSize);
+        pos += mix(vec3(0.0), worldSize, lessThan(pos, vec3(0.0)));
+        pos -= limit;
+    } else {
+        if (pos.x < -limit.x || pos.x > limit.x) {
+            velocity.x *= -uBoundaryBounce;
+            pos.x = clamp(pos.x, -limit.x, limit.x);
+        }
+        if (pos.y < -limit.y || pos.y > limit.y) {
+            velocity.y *= -uBoundaryBounce;
+            pos.y = clamp(pos.y, -limit.y, limit.y);
+        }
+        if (pos.z < -limit.z || pos.z > limit.z) {
+            velocity.z *= -uBoundaryBounce;
+            pos.z = clamp(pos.z, -limit.z, limit.z);
+        }
+    }
+
+    particles[id].positionType.xyz = pos;
+    particles[id].velocity.xyz = velocity;
+}
